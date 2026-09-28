@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+*.egg-info/
+
+# Python cache and test artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments
+venv/
+.venv/
+
+# Local runtime logs and temporary files
+logs/
+*.log
+flask_*.log
+tunnel_*.log
+*.pid
+
+# Secrets and local configuration
+.env
+.env.*
+*.local.json
+
+# Local-only third-party assets pending licensing / manifest review
+assets/
+
+# Replaced or obsolete screenshots
+screenshots/02_waiting_yellow_safety_gate_open.png

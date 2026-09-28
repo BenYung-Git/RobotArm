@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "mode": "virtual_only",
+  "inputs": {
+    "part_present": true,
+    "fixture_clamped": true,
+    "welder_ready": true,
+    "safety_gate_closed": true
+  },
+  "outputs": {
+    "stack_light_green": true,
+    "stack_light_red": false,
+    "cycle_running": false
+  }
+}

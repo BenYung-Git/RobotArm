@@ -1,0 +1,12 @@
+{
+  "name": "Pose B",
+  "description": "Side-reach demo pose: shoulder rotated -90deg, elbow half-folded, wrist aligned.",
+  "joints_rad": [
+    -1.5707963267948966,
+    -1.0471975511965976,
+    1.2217304763960307,
+    -1.7453292519943295,
+    -1.5707963267948966,
+    0.0
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "job_id": "DEMO_SEQUENCE_001",
+  "name": "Virtual Demo Sequence",
+  "mode": "virtual_only",
+  "required_inputs": [
+    "part_present",
+    "fixture_clamped",
+    "welder_ready",
+    "safety_gate_closed"
+  ],
+  "steps": [
+    {"step_id": "step_01", "action": "move_pose", "pose": "home"},
+    {"step_id": "step_02", "action": "move_pose", "pose": "pose_a"},
+    {"step_id": "step_03", "action": "move_pose", "pose": "pose_b"},
+    {"step_id": "step_04", "action": "move_pose", "pose": "home"}
+  ]
+}

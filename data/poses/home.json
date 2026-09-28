@@ -1,0 +1,5 @@
+{
+  "name": "Home",
+  "description": "All-zero joint pose; UR5 default 'home' position used by demos and tutorials.",
+  "joints_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}

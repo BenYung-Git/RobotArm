@@ -1,0 +1,12 @@
+{
+  "name": "Pose A",
+  "description": "Reach-forward demo pose: shoulder rotated 90deg, elbow half-folded, wrist aligned.",
+  "joints_rad": [
+    1.5707963267948966,
+    -0.7853981633974483,
+    1.5707963267948966,
+    -1.5707963267948966,
+    -1.5707963267948966,
+    0.0
+  ]
+}
