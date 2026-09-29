@@ -31,3 +31,4 @@ assets/
 
 # Replaced or obsolete screenshots
 screenshots/02_waiting_yellow_safety_gate_open.png
+gen_progress_pdf.py
