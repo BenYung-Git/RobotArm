@@ -15,6 +15,7 @@ context but the *current* code base is Phase 1C.
 | **Phase 1A** | ✅ shipped | URDF asset + joint limits + PyBullet-driven 6-DOF motion (`demos/interactive_demo.py`) |
 | **Phase 1B** | ✅ shipped | Flask web UI + 6 sliders + buttons + HTTP `/api/state` polling |
 | **Phase 1C** | ✅ shipped (this build) | Adds the **Virtual Controller Cabinet** that mediates every motion, E-stop, fault, and job. Adds brand-neutral Virtual I/O, a backend-computed **Virtual Status Light**, and the Demo Sequence (Home → Pose A → Pose B → Home). |
+| **Phase 1C bug-fix** (2026-09-16) | ✅ shipped | Added `WAITING` cabinet state so readiness-missing inputs are reflected in the cabinet state (not only in the status light). Added `last_job_result` payload so the UI retains the most recent terminal job result instead of clearing to `—`. |
 
 ## How to run it (local-only)
 
@@ -38,7 +39,7 @@ UI (HTML + JS, polls every 400 ms)
 HTTP /api/v1/* (Flask, cabinet-mediated)
   ↓
 VirtualControllerCabinet (state machine + IO + JobRunner ownership)
-  ├─ CabinetState   : OFFLINE | READY | RUNNING | ESTOP | PROTECTIVE_STOP | FAULT
+  ├─ CabinetState   : OFFLINE | READY | WAITING | RUNNING | ESTOP | PROTECTIVE_STOP | FAULT
   ├─ SafetyState    : normal | estop | protective_stop | fault
   ├─ MotionState    : idle | moving | stopped
   ├─ VirtualIO      : brand-neutral inputs (whitelist, session-only, no JSON write-back)
@@ -105,9 +106,33 @@ never derives colour/label/blink from raw state.
 | `PROTECTIVE_STOP` (other cause) | red | no | Virtual Fault / Motion Blocked | 虛擬故障／運動已封鎖 |
 | `FAULT` | red | no | Virtual Fault / Motion Blocked (with the fault message) | 虛擬故障／運動已封鎖 |
 | `OFFLINE` | gray | no | Offline / Disabled | 離線 / 停用 |
-| `READY` with a required input False | yellow | no | Virtual Warning / Waiting (names the missing input) | 等待條件完成 |
-| `READY` all inputs satisfied | green | no | Virtual System Ready | 虛擬系統就緒 |
-| `RUNNING` all inputs satisfied | green | no | Virtual System Ready | 虛擬系統就緒 |
+| `WAITING` (non-safety readiness missing) | yellow | no | Virtual Warning / Waiting (names the first missing input) | 等待條件完成 |
+| `READY` | green | no | Virtual System Ready | 虛擬系統就緒 |
+| `RUNNING` | green | no | Virtual Cycle Running — "Running DEMO_SEQUENCE_001, step N / total" | 虛擬工序執行中 |
+
+**Safety priority** (highest wins): `ESTOP` > `FAULT` / `PROTECTIVE_STOP`
+> `WAITING` > `READY` / `RUNNING` / `OFFLINE`. The cabinet's
+`_re_evaluate_idle_readiness_locked` helper is the single source of
+truth for the `READY` ↔ `WAITING` flip; the status-light code only
+*reads* `cabinet_state == WAITING` to render the yellow colour — it
+never mutates cabinet state.
+
+**Resets re-evaluate readiness.** `reset_estop`, `reset_fault`, and
+`reset_protective_stop` all call `_re_evaluate_idle_readiness_locked`
+after transitioning to `READY`. If a non-safety readiness input is
+still missing, the cabinet returns to `WAITING` — not directly to
+`READY`. The safety gate is *never* a yellow reason: an open gate is
+always `PROTECTIVE_STOP` (Red).
+
+**WAITING with stack lights.** The cabinet-managed outputs
+`stack_light_red` and `cycle_running` are driven exclusively by safety
+triggers and the job runner. `set_input()` for non-safety readiness
+inputs does NOT change `stack_light_green` / `stack_light_red` /
+`cycle_running`. During `WAITING` (caused by a missing readiness
+input), the **green stack light stays ON**, the red light stays OFF,
+and `cycle_running` stays OFF. This is intentional — `stack_light_*`
+is a separate output from the cabinet state and reflects the safety /
+cycle status, not the readiness status.
 
 The UI panel always carries **three disclaimer lines** under the status
 light, regardless of state:
@@ -166,10 +191,54 @@ writes back to `data/virtual_io/default.json`. Verified by pytest
 }
 ```
 
-After step_04 the cabinet transitions RUNNING → READY, the runner is
-cleared, and `current_job_progress()` returns the **last completed
-snapshot** (with `completed: true`, `total_steps: 4`) until the next job
-overwrites it.
+After step_04 the cabinet transitions RUNNING → READY (or `WAITING`
+if a non-safety readiness input became missing during the job), the
+runner is cleared, and `current_job_progress()` returns the **last
+completed snapshot** (with `completed: true`, `total_steps: 4`) until
+the next job overwrites it.
+
+### Last Job Result (UI retention)
+
+After a job terminates (completed / cancelled / failed), the cabinet
+exposes its terminal state via the `last_job_result` field in
+`/api/v1/status` and `CabinetStatus.to_status_payload()`. The UI
+renders this field when no active job is running.
+
+Schema:
+
+```json
+{
+  "job_id": "DEMO_SEQUENCE_001",
+  "current_step_index": 4,
+  "total_steps": 4,
+  "current_step": "Completed",        // English label
+  "current_step_zh": "已完成",         // Chinese label
+  "completed": true,
+  "result": "completed",              // "completed" | "cancelled" | "failed"
+  "success": true,                    // false for cancelled/failed
+  "elapsed_s": 1.234,
+  "finished_at": 1700000000.123      // unix seconds
+}
+```
+
+UI render priority (in `web/static/app.js`):
+
+1. `active_job_id` set → live progress for the running job
+2. `active_job_id` null + `last_job_result` present → terminal result
+   of the most recent job (job id, progress, current step, elapsed)
+3. Both absent → all fields show `—`
+
+`last_job_result` is cleared **only** when a new job successfully
+passes the interlock and actually starts (`start_job()` after all
+checks). A rejected `start_job()` (gate open / WAITING / ESTOP /
+FAULT / PROTECTIVE_STOP / interlock missing) does **not** clear the
+previous terminal result — the UI keeps showing it.
+
+Verified by:
+- `tests/test_phase1c_cabinet.py::test_completed_demo_job_retains_last_result`
+- `tests/test_phase1c_cabinet.py::test_starting_new_job_replaces_previous_terminal_result`
+- `tests/test_phase1c_cabinet.py::test_rejected_new_job_does_not_clear_previous_terminal_result`
+- `tests/test_phase1c_cabinet.py::test_status_payload_exposes_last_job_result_after_completion`
 
 ## Job-run ownership & race-condition guard
 
@@ -221,21 +290,23 @@ cd /tmp/robotarm_demo
 Expected output:
 
 ```
-tests/test_estop_blocks_movement.py ..........                          [  8%]
-tests/test_home_motion.py ..                                            [ 10%]
-tests/test_joint_limits.py .......                                      [ 17%]
-tests/test_json_pose_validation.py ...........                           [ 27%]
-tests/test_phase1c_cabinet.py .......................................... [ 66%]
-...                                                                     [ 69%]
-tests/test_safety_guard.py .........                                    [ 78%]
-tests/test_urdf_asset.py ......                                         [ 83%]
+tests/test_estop_blocks_movement.py ..........                          [  6%]
+tests/test_home_motion.py ..                                            [  8%]
+tests/test_joint_limits.py ........                                      [ 13%]
+tests/test_json_pose_validation.py ...........                           [ 20%]
+tests/test_phase1c_cabinet.py .......................................... [ 48%]
+.........................................                                [ 76%]
+tests/test_safety_guard.py .........                                    [ 82%]
+tests/test_urdf_asset.py ......                                         [ 86%]
 tests/test_virtual_io.py ....................                           [100%]
 
-===================== 111 passed in ~20s ======================
+===================== 149 passed in ~45s =====================
 ```
 
-(Exact count varies; the Phase 1C group has 45 tests, the Phase 1 group
-has 46, plus the 20 Virtual-IO tests = 111.)
+(Exact count varies as the Phase 1C group grows with bug-fix
+regressions; current count is 149 = 10 + 2 + 8 + 11 + 83 + 9 + 6 + 20.
+Bug-fix regressions added 23 new tests on 2026-09-16 covering the
+`WAITING` cabinet state and `last_job_result` UI retention.)
 
 ## UI screenshots
 

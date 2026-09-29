@@ -17,7 +17,7 @@ The Status Light is **brand-neutral** and explicitly disclaims association with
 ROKAE, JAKA, or any real controller. The UI is responsible for displaying the
 disclaimer text; this module just supplies the state.
 
-Mapping (per Phase 1C final spec, 2026-09-16):
+Mapping (per Phase 1C final spec, 2026-09-16 + 2026-09-16 bug fix):
 
     CabinetState.ESTOP                       -> red, blinking, "Virtual E-stop Active"
     CabinetState.PROTECTIVE_STOP             -> red, static,    "Virtual Fault / Motion Blocked"
@@ -26,18 +26,23 @@ Mapping (per Phase 1C final spec, 2026-09-16):
     CabinetState.FAULT                       -> red, static,    "Virtual Fault / Motion Blocked"
         - reason: virtual fault reason
     CabinetState.OFFLINE                     -> gray, static,   "Offline / Disabled"
+    CabinetState.WAITING                     -> yellow, static, "Virtual Warning / Waiting"
+        - reason: names the FIRST missing non-safety readiness input
+          (part_present / fixture_clamped / welder_ready).
+          SAFETY rule: safety_gate_closed is NEVER a yellow reason.
     CabinetState.READY + all readiness inputs true -> green, static, "Virtual System Ready"
-    CabinetState.READY + readiness input false (NON-safety) -> yellow, static,
-        "Virtual Warning / Waiting", reason names the missing input:
-            part_present     -> "Part Not Present"
-            fixture_clamped  -> "Fixture Not Clamped"
-            welder_ready     -> "Welder Not Ready"
     CabinetState.RUNNING                     -> green, static,
         "Virtual Cycle Running", reason includes job_id + current/total steps.
 
 Safety rule: ``safety_gate_closed=False`` is a SAFETY condition, not a
 readiness condition. It can never produce a Yellow "Waiting" state — only
 Red PROTECTIVE_STOP. The UI / tests must verify this distinction.
+
+WAITING rule: WAITING is a cabinet state, not just a status-light color.
+This module's status-light logic for WAITING reads from the (already
+computed) cabinet_state passed in by the caller — it does NOT mutate
+cabinet state. The cabinet's ``_re_evaluate_idle_readiness_locked``
+helper is the single source of truth for READY <-> WAITING flips.
 """
 from __future__ import annotations
 
@@ -173,12 +178,21 @@ def compute_status_light(
         3. FAULT                       -> red, "Virtual Fault / Motion Blocked"
                                           (reason = motion_blocked_reason)
         4. OFFLINE                     -> gray, "Offline / Disabled"
-        5. READY + any readiness input False (non-safety) -> yellow,
-           "Virtual Warning / Waiting" with input-specific reason
+        5. WAITING                     -> yellow, "Virtual Warning / Waiting"
+                                          (reason = first missing non-safety
+                                          readiness input; safety_gate is
+                                          never a yellow reason — gate-open
+                                          is PROTECTIVE_STOP, handled above.)
         6. READY + all readiness true  -> green, "Virtual System Ready"
         7. RUNNING                     -> green, "Virtual Cycle Running"
                                           (reason = job_id + step/total)
         8. otherwise (fallback)        -> gray
+
+    Note: WAITING is a CabinetState — the cabinet's
+    ``_re_evaluate_idle_readiness_locked`` helper decides whether to
+    transition into or out of it. This function merely derives the
+    status-light from the cabinet state passed in. It MUST NOT mutate
+    cabinet state.
     """
     # 1. E-stop wins
     if cabinet_state == CabinetState.ESTOP or safety_state == SafetyState.ESTOP:
@@ -225,9 +239,12 @@ def compute_status_light(
             reason_en="Virtual cabinet offline or disabled.",
         )
 
-    # 5. READY + non-safety readiness input missing -> Yellow
-    #    SAFETY rule: safety_gate_closed is NEVER a Yellow reason.
-    if cabinet_state == CabinetState.READY and required_inputs:
+    # 5. WAITING -> yellow "Virtual Warning / Waiting".
+    #    The cabinet's _re_evaluate_idle_readiness_locked decided this
+    #    cabinet is in WAITING; we only render the colour + reason.
+    #    Reason picks the FIRST missing non-safety readiness input
+    #    (safety_gate_closed is intentionally never a yellow reason).
+    if cabinet_state == CabinetState.WAITING and required_inputs:
         for sig in required_inputs:
             if sig == "safety_gate_closed":
                 continue  # SAFETY — never Yellow
@@ -237,6 +254,13 @@ def compute_status_light(
                     sig, (f"等待輸入:{sig}", f"Waiting on input: {sig}")
                 )
                 return _yellow(reason_zh=zh, reason_en=en)
+        # Fallback if all required_inputs satisfied but cabinet somehow
+        # still in WAITING (should not happen — single source of truth is
+        # the cabinet's re-eval helper). Surface a generic yellow.
+        return _yellow(
+            reason_zh="等待條件完成",
+            reason_en="Virtual Warning / Waiting",
+        )
 
     # 6. READY + all readiness true -> Green "Virtual System Ready"
     if cabinet_state == CabinetState.READY:

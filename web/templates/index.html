@@ -22,8 +22,128 @@
       <span class="lang-sep">|</span>
       <a href="?lang=zh" id="lang-zh" class="lang-link{% if lang == 'zh' %} lang-active{% endif %}">中文</a>
     </div>
+    <button type="button" id="btn-status-copy" class="status-copy-btn"
+            data-i18n="btn_status_copy"
+            title="Open a plain-text status snapshot for easy copy/paste">Status</button>
   </div>
 </header>
+
+<!-- Status copy modal: plain-text snapshot of current cabinet / job state.
+     Opened by #btn-status-copy. Background click + Esc + Close button all
+     dismiss the modal. -->
+<div id="status-modal-backdrop" class="status-modal-backdrop hidden" aria-hidden="true">
+  <div id="status-modal" class="status-modal" role="dialog" aria-modal="true"
+       aria-labelledby="status-modal-title">
+    <div class="status-modal-header">
+      <h2 id="status-modal-title" data-i18n="status_modal_title">Status Snapshot</h2>
+      <button type="button" id="status-modal-close" class="status-modal-close-x"
+              aria-label="Close">&times;</button>
+    </div>
+    <p class="status-modal-hint" data-i18n="status_modal_hint">
+      Plain-text snapshot. Use Ctrl+A / Ctrl+C to copy.
+    </p>
+    <pre id="status-modal-body" class="status-modal-body" tabindex="0">—</pre>
+    <div class="status-modal-footer">
+      <button type="button" id="status-modal-close-btn" class="status-modal-close-btn"
+              data-i18n="status_modal_close">Close</button>
+    </div>
+  </div>
+</div>
+
+<style>
+/* Status copy modal — minimal CSS kept inline so this feature is
+   self-contained in app.js + index.html only (per Ben's instruction
+   not to touch style.css for this addition). */
+.status-copy-btn {
+  flex-shrink: 0;
+  margin-top: 4px;
+  padding: 6px 14px;
+  font: inherit;
+  background: var(--card, #1e1e1e);
+  color: var(--text, #eee);
+  border: 1px solid var(--muted, #888);
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.status-copy-btn:hover { background: var(--accent, #2a2a2a); }
+.status-copy-btn:active { transform: translateY(1px); }
+
+.status-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.status-modal-backdrop.hidden { display: none; }
+.status-modal {
+  background: var(--card, #1e1e1e);
+  color: var(--text, #eee);
+  border: 1px solid var(--muted, #888);
+  border-radius: 6px;
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+}
+.status-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--muted, #444);
+}
+.status-modal-header h2 { margin: 0; font-size: 1.1em; }
+.status-modal-close-x {
+  background: transparent;
+  border: 0;
+  color: var(--text, #eee);
+  font-size: 1.4em;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 4px;
+}
+.status-modal-hint {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 0.85em;
+  color: var(--muted, #aaa);
+  border-bottom: 1px solid var(--muted, #444);
+}
+.status-modal-body {
+  margin: 0;
+  padding: 12px 16px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  flex: 1 1 auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.status-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 16px;
+  border-top: 1px solid var(--muted, #444);
+}
+.status-modal-close-btn {
+  padding: 6px 16px;
+  font: inherit;
+  background: var(--card, #1e1e1e);
+  color: var(--text, #eee);
+  border: 1px solid var(--muted, #888);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.status-modal-close-btn:hover { background: var(--accent, #2a2a2a); }
+</style>
 
 <main>
   <!-- Phase 1C: Cabinet identity strip ----------------------------------- -->

@@ -155,8 +155,17 @@ def test_status_light_running_green() -> None:
 
 
 def test_status_light_missing_required_input_is_yellow() -> None:
+    """WAITING cabinet + missing non-safety readiness input -> Yellow.
+
+    Updated 2026-09-16: WAITING is now a real CabinetState. The
+    status_light logic for "yellow because readiness is missing" is
+    driven by ``cabinet_state == WAITING``, not by inspecting the
+    required_inputs while READY. The cabinet's
+    ``_re_evaluate_idle_readiness_locked`` is the single source of
+    truth for the READY <-> WAITING flip.
+    """
     sl = compute_status_light(
-        cabinet_state=CabinetState.READY,
+        cabinet_state=CabinetState.WAITING,
         safety_state=SafetyState.NORMAL,
         virtual_inputs={"part_present": True, "fixture_clamped": False,
                         "welder_ready": True, "safety_gate_closed": True},
@@ -174,10 +183,15 @@ def test_status_light_missing_required_input_is_yellow() -> None:
 # ---------------------------------------------------------------------------
 
 def test_yellow_fixture_not_clamped_when_gate_closed() -> None:
-    """``fixture_clamped=False``, ``safety_gate_closed=True``, READY →
-    Yellow, reason="Fixture Not Clamped" (NOT safety-gate)."""
+    """``fixture_clamped=False``, ``safety_gate_closed=True``, WAITING →
+    Yellow, reason="Fixture Not Clamped" (NOT safety-gate).
+
+    Updated 2026-09-16: cabinet state is now WAITING (not READY) when
+    non-safety readiness is missing. The safety gate remains closed and
+    is intentionally not a Yellow reason.
+    """
     sl = compute_status_light(
-        cabinet_state=CabinetState.READY,
+        cabinet_state=CabinetState.WAITING,
         safety_state=SafetyState.NORMAL,
         virtual_inputs={"part_present": True, "fixture_clamped": False,
                         "welder_ready": True, "safety_gate_closed": True},
@@ -198,7 +212,7 @@ def test_yellow_fixture_not_clamped_when_gate_closed() -> None:
 
 def test_yellow_part_not_present() -> None:
     sl = compute_status_light(
-        cabinet_state=CabinetState.READY,
+        cabinet_state=CabinetState.WAITING,
         safety_state=SafetyState.NORMAL,
         virtual_inputs={"part_present": False, "fixture_clamped": True,
                         "welder_ready": True, "safety_gate_closed": True},
@@ -212,7 +226,7 @@ def test_yellow_part_not_present() -> None:
 
 def test_yellow_welder_not_ready() -> None:
     sl = compute_status_light(
-        cabinet_state=CabinetState.READY,
+        cabinet_state=CabinetState.WAITING,
         safety_state=SafetyState.NORMAL,
         virtual_inputs={"part_present": True, "fixture_clamped": True,
                         "welder_ready": False, "safety_gate_closed": True},
@@ -951,3 +965,458 @@ def test_webrobot_connect_rejects_non_loopback() -> None:
     r = WebRobot(robot_id="test_conn")
     with pytest.raises(Exception):
         r.connect(target="192.168.1.100:30004")
+
+# ===========================================================================
+# 2026-09-16 Bug-01: WAITING state synchronization
+# ===========================================================================
+#
+# Bug spec: when a non-safety readiness input (part_present /
+# fixture_clamped / welder_ready) is False and no E-stop / Fault /
+# Protective Stop is active, the cabinet state MUST be WAITING (not
+# READY) and the status light MUST be yellow. Motion / job start must
+# be blocked in WAITING. Safety priority ESTOP > FAULT/PROT > WAITING
+# > READY must be preserved at all times.
+#
+# These tests do NOT touch the real Flask server. They exercise the
+# VirtualControllerCabinet directly with the project seed files.
+
+
+# ---------------------------------------------------------------------------
+# Bug-01 — WAITING state from non-safety readiness changes
+# ---------------------------------------------------------------------------
+
+def test_workpiece_absent_sets_waiting_state(cabinet_with_tick) -> None:
+    """part_present=False -> cabinet state = WAITING, status yellow,
+    cycle_running false, motion blocked."""
+    cab = cabinet_with_tick
+    assert cab.state == CabinetState.READY
+    cab.set_input("part_present", False)
+    assert cab.state == CabinetState.WAITING
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.WAITING
+    assert s.status_light.color == "yellow"
+    assert s.virtual_outputs.get("cycle_running") is False
+    # motion must be blocked
+    with pytest.raises(VirtualSafetyStopError):
+        cab.move_home()
+    # job start must be blocked (VirtualInterlockError per D2)
+    with pytest.raises(VirtualInterlockError):
+        cab.start_job()
+
+
+def test_fixture_not_clamped_sets_waiting_state(cabinet_with_tick) -> None:
+    """fixture_clamped=False -> cabinet state = WAITING."""
+    cab = cabinet_with_tick
+    cab.set_input("fixture_clamped", False)
+    assert cab.state == CabinetState.WAITING
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.WAITING
+    assert s.status_light.color == "yellow"
+    assert s.status_light.reason_en == "Fixture Not Clamped"
+    assert s.status_light.reason_zh == "治具未夾緊"
+    with pytest.raises(VirtualSafetyStopError):
+        cab.move_home()
+    with pytest.raises(VirtualInterlockError):
+        cab.start_job()
+
+
+def test_welder_not_ready_sets_waiting_state(cabinet_with_tick) -> None:
+    """welder_ready=False -> cabinet state = WAITING."""
+    cab = cabinet_with_tick
+    cab.set_input("welder_ready", False)
+    assert cab.state == CabinetState.WAITING
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.WAITING
+    assert s.status_light.color == "yellow"
+    assert s.status_light.reason_en == "Welder Not Ready"
+    with pytest.raises(VirtualSafetyStopError):
+        cab.move_home()
+    with pytest.raises(VirtualInterlockError):
+        cab.start_job()
+
+
+def test_waiting_state_blocks_demo_job_or_motion(cabinet_with_tick) -> None:
+    """WAITING -> start_job raises VirtualInterlockError with missing
+    inputs list; move_home / set_targets raise VirtualSafetyStopError."""
+    cab = cabinet_with_tick
+    cab.set_input("fixture_clamped", False)
+    cab.set_input("welder_ready", False)
+    assert cab.state == CabinetState.WAITING
+    # start_job must raise VirtualInterlockError, not CabinetStateError.
+    with pytest.raises(VirtualInterlockError) as ei:
+        cab.start_job()
+    missing = ei.value.missing
+    assert "fixture_clamped" in missing
+    assert "welder_ready" in missing
+    # move_home must raise VirtualSafetyStopError naming the missing input.
+    with pytest.raises(VirtualSafetyStopError) as em:
+        cab.move_home()
+    assert "waiting for" in str(em.value).lower()
+    # set_joint_targets must also be blocked.
+    with pytest.raises(VirtualSafetyStopError):
+        cab.set_joint_targets([0.0] * 6)
+
+
+def test_all_inputs_restored_returns_to_ready(cabinet_with_tick) -> None:
+    """Three non-safety readiness inputs all True -> WAITING flips back
+    to READY (single source of truth: cabinet's re-eval helper)."""
+    cab = cabinet_with_tick
+    cab.set_input("part_present", False)
+    assert cab.state == CabinetState.WAITING
+    cab.set_input("part_present", True)
+    assert cab.state == CabinetState.READY
+    # restore order does not matter
+    cab.set_input("fixture_clamped", False)
+    cab.set_input("welder_ready", False)
+    assert cab.state == CabinetState.WAITING
+    cab.set_input("fixture_clamped", True)
+    # still waiting because welder_ready still missing
+    assert cab.state == CabinetState.WAITING
+    cab.set_input("welder_ready", True)
+    assert cab.state == CabinetState.READY
+
+
+# ---------------------------------------------------------------------------
+# Bug-01 — Safety priority must beat WAITING
+# ---------------------------------------------------------------------------
+
+def test_estop_beats_waiting(cabinet_with_tick) -> None:
+    """WAITING + trigger_estop -> ESTOP (priority over WAITING)."""
+    cab = cabinet_with_tick
+    cab.set_input("fixture_clamped", False)
+    assert cab.state == CabinetState.WAITING
+    cab.trigger_estop()
+    assert cab.state == CabinetState.ESTOP
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.ESTOP
+    assert s.status_light.color == "red"
+    assert s.status_light.is_blinking is True
+
+
+def test_fault_beats_waiting(cabinet_with_tick) -> None:
+    """WAITING + trigger_fault -> FAULT."""
+    cab = cabinet_with_tick
+    cab.set_input("welder_ready", False)
+    assert cab.state == CabinetState.WAITING
+    cab.trigger_fault("VIRTUAL_FAULT", "test")
+    assert cab.state == CabinetState.FAULT
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.FAULT
+    assert s.status_light.color == "red"
+    assert s.status_light.is_blinking is False
+
+
+def test_safety_gate_open_beats_waiting(cabinet_with_tick) -> None:
+    """WAITING + safety_gate_closed=False -> PROTECTIVE_STOP (gate is a
+    SAFETY input and must NEVER produce WAITING)."""
+    cab = cabinet_with_tick
+    cab.set_input("welder_ready", False)
+    assert cab.state == CabinetState.WAITING
+    cab.set_input("safety_gate_closed", False)
+    assert cab.state == CabinetState.PROTECTIVE_STOP
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.PROTECTIVE_STOP
+    assert s.status_light.color == "red"
+    assert s.status_light.reason_en == "Virtual Safety Gate Open"
+
+
+def test_protective_stop_requires_explicit_reset(cabinet_with_tick) -> None:
+    """WAITING -> PROTECTIVE_STOP (gate open) -> close gate -> cabinet
+    stays in PROTECTIVE_STOP (NOT auto-reset)."""
+    cab = cabinet_with_tick
+    cab.set_input("welder_ready", False)
+    cab.set_input("safety_gate_closed", False)
+    assert cab.state == CabinetState.PROTECTIVE_STOP
+    cab.set_input("safety_gate_closed", True)
+    # Cabinet must NOT auto-reset.
+    assert cab.state == CabinetState.PROTECTIVE_STOP
+    # Operator must press reset_protective_stop.
+    cab.reset_protective_stop()
+    # After reset: re-eval checks readiness — welder_ready is still off,
+    # so cabinet should land on WAITING, not READY (per D3).
+    assert cab.state == CabinetState.WAITING
+
+
+# ---------------------------------------------------------------------------
+# Bug-01 — D3: safety resets re-evaluate readiness
+# ---------------------------------------------------------------------------
+
+def test_reset_estop_re_evaluates_waiting_readiness(cabinet_with_tick) -> None:
+    """READY -> WAITING (fixture off) -> ESTOP -> reset_estop.
+    Re-eval must land on WAITING (fixture still off), not READY."""
+    cab = cabinet_with_tick
+    cab.set_input("fixture_clamped", False)
+    assert cab.state == CabinetState.WAITING
+    cab.trigger_estop()
+    assert cab.state == CabinetState.ESTOP
+    cab.reset_estop()
+    # Re-eval: fixture still off -> WAITING (NOT READY).
+    assert cab.state == CabinetState.WAITING
+    # Now restore fixture -> cabinet should flip back to READY.
+    cab.set_input("fixture_clamped", True)
+    assert cab.state == CabinetState.READY
+
+
+def test_reset_fault_re_evaluates_waiting_readiness(cabinet_with_tick) -> None:
+    """READY -> WAITING (welder off) -> FAULT -> reset_fault.
+    Re-eval must land on WAITING, not READY."""
+    cab = cabinet_with_tick
+    cab.set_input("welder_ready", False)
+    assert cab.state == CabinetState.WAITING
+    cab.trigger_fault("VIRTUAL_FAULT", "test")
+    assert cab.state == CabinetState.FAULT
+    cab.reset_fault()
+    # Re-eval: welder still off -> WAITING.
+    assert cab.state == CabinetState.WAITING
+    cab.set_input("welder_ready", True)
+    assert cab.state == CabinetState.READY
+
+
+def test_reset_protective_stop_re_evaluates_waiting_readiness(
+        cabinet_with_tick) -> None:
+    """READY -> WAITING (part off) -> trigger_protective_stop ->
+    reset_protective_stop -> re-eval lands on WAITING (part still off)."""
+    cab = cabinet_with_tick
+    cab.set_input("part_present", False)
+    assert cab.state == CabinetState.WAITING
+    cab.trigger_protective_stop()
+    assert cab.state == CabinetState.PROTECTIVE_STOP
+    cab.reset_protective_stop()
+    # Re-eval: part still off -> WAITING (NOT READY).
+    assert cab.state == CabinetState.WAITING
+    cab.set_input("part_present", True)
+    assert cab.state == CabinetState.READY
+
+
+def test_reset_estop_when_all_ready_returns_to_ready(cabinet_with_tick) -> None:
+    """If readiness is fully restored by the time we reset, cabinet
+    returns to READY (not WAITING)."""
+    cab = cabinet_with_tick
+    cab.set_input("fixture_clamped", False)
+    assert cab.state == CabinetState.WAITING
+    cab.trigger_estop()
+    assert cab.state == CabinetState.ESTOP
+    # Restore readiness while in ESTOP.
+    cab.set_input("fixture_clamped", True)
+    # Still ESTOP — readiness re-eval does not happen during safety state.
+    assert cab.state == CabinetState.ESTOP
+    cab.reset_estop()
+    # Now re-eval runs — readiness is satisfied -> READY.
+    assert cab.state == CabinetState.READY
+
+
+# ---------------------------------------------------------------------------
+# Bug-01 — WAITING <-> status-light single source of truth
+# ---------------------------------------------------------------------------
+
+def test_status_light_does_not_drive_cabinet_state(cabinet_with_tick) -> None:
+    """Regression: status_light is purely a function of cabinet_state.
+    It must NEVER mutate cabinet state. Setting fixture_clamped=False
+    transitions cabinet state directly; status light just renders."""
+    cab = cabinet_with_tick
+    cab.set_input("fixture_clamped", False)
+    # State went to WAITING because the cabinet's re-eval helper
+    # decided so — NOT because the status light told it to.
+    assert cab.state == CabinetState.WAITING
+    # If we manually set the state back to READY while the input is
+    # still missing, the next set_input call should snap it back to
+    # WAITING — confirming the re-eval helper is the only source of
+    # truth for the flip.
+    cab._state = CabinetState.READY  # direct mutation, no helper
+    cab.set_input("part_present", True)  # any non-safety input triggers re-eval
+    assert cab.state == CabinetState.WAITING
+
+
+# ===========================================================================
+# 2026-09-16 Bug-02: Demo Job completion result retention
+# ===========================================================================
+#
+# Bug spec: after a demo job completes naturally, the UI must continue to
+# show the job's last result (job_id, progress, current_step, result,
+# elapsed) instead of clearing it to "—". The cabinet must end up in
+# READY (or WAITING if readiness is now missing), cycle_running must be
+# False, and a successful subsequent job must replace the prior result.
+# A rejected new job must NOT clear the prior terminal result.
+
+
+def _wait_for_completion(cab, timeout_s: float = 30.0) -> dict:
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        last = cab.current_job_progress()
+        if last and last.get("completed") is True:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"Job did not complete within {timeout_s}s; last={last}")
+
+
+def test_completed_demo_job_retains_last_result(cabinet_with_tick) -> None:
+    """After natural completion, CabinetStatus.last_job_result is set
+    with the right schema (job_id, completed, result, success, etc.)."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    s = cab.get_status()
+    assert s.last_job_result is not None
+    r = s.last_job_result
+    assert r["job_id"] == "DEMO_SEQUENCE_001"
+    assert r["completed"] is True
+    assert r["result"] == "completed"
+    assert r["success"] is True
+    assert r["current_step"] == "Completed"
+    assert r["current_step_zh"] == "已完成"
+
+
+def test_completed_demo_job_reports_final_progress(cabinet_with_tick) -> None:
+    """Final progress is 4 / 4 (job has 4 steps)."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    r = cab.get_status().last_job_result
+    assert r["total_steps"] == 4
+    assert r["current_step_index"] == 4
+    # elapsed_s must be present and >= 0
+    assert isinstance(r["elapsed_s"], (int, float))
+    assert r["elapsed_s"] >= 0
+    assert isinstance(r["finished_at"], (int, float))
+
+
+def test_completed_demo_job_returns_cabinet_to_ready_or_waiting(
+        cabinet_with_tick) -> None:
+    """After natural completion, cabinet state is READY (if readiness
+    is still satisfied) or WAITING (if readiness became unsatisfied
+    during the job). In this baseline case readiness stays satisfied."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    assert cab.state == CabinetState.READY
+    s = cab.get_status()
+    assert s.cabinet_state == CabinetState.READY
+
+
+def test_completed_demo_job_sets_cycle_running_false(cabinet_with_tick) -> None:
+    """After completion, virtual output cycle_running must be False."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    s = cab.get_status()
+    assert s.virtual_outputs.get("cycle_running") is False
+    assert s.virtual_outputs.get("stack_light_green") is True
+    assert s.virtual_outputs.get("stack_light_red") is False
+
+
+def test_starting_new_job_replaces_previous_terminal_result(
+        cabinet_with_tick) -> None:
+    """After the first job completes and a SECOND job starts successfully,
+    the new active_job_id appears and last_job_result is cleared (because
+    the UI now renders the active job)."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    assert cab.get_status().last_job_result is not None
+    # Start a second job.
+    cab.set_input("fixture_clamped", False)  # simulate readiness going missing then restored
+    cab.set_input("fixture_clamped", True)
+    jid = cab.start_job()
+    assert jid == "DEMO_SEQUENCE_001"
+    # While the new job is running, last_job_result must be cleared (UI
+    # now shows active job, not terminal result).
+    s = cab.get_status()
+    assert s.last_job_result is None
+    # Wait for it to complete to clean up.
+    _wait_for_completion(cab)
+
+
+def test_rejected_new_job_does_not_clear_previous_terminal_result(
+        cabinet_with_tick) -> None:
+    """If start_job() is rejected (e.g. WAITING or interlock fail), the
+    previous terminal result must NOT be cleared."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    prior = cab.get_status().last_job_result
+    assert prior is not None
+
+    # Force cabinet into WAITING (by clearing a readiness input).
+    cab.set_input("fixture_clamped", False)
+    # start_job must be rejected with VirtualInterlockError.
+    with pytest.raises(VirtualInterlockError):
+        cab.start_job()
+    # last_job_result must still be the previous terminal result.
+    s = cab.get_status()
+    assert s.last_job_result is not None
+    assert s.last_job_result["job_id"] == prior["job_id"]
+    assert s.last_job_result["completed"] is True
+    # Also test the gate-open reject path.
+    cab.set_input("fixture_clamped", True)
+    assert cab.state == CabinetState.READY
+    cab.set_input("safety_gate_closed", False)
+    with pytest.raises(VirtualSafetyStopError):
+        cab.start_job()
+    s = cab.get_status()
+    assert s.last_job_result is not None
+    assert s.last_job_result["job_id"] == prior["job_id"]
+
+
+def test_status_payload_exposes_last_job_result_after_completion(
+        cabinet_with_tick) -> None:
+    """After completion, /api/v1/status payload includes last_job_result
+    with the documented schema."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    s = cab.get_status().to_status_payload()
+    assert "last_job_result" in s
+    r = s["last_job_result"]
+    assert r is not None
+    assert r["job_id"] == "DEMO_SEQUENCE_001"
+    assert r["completed"] is True
+    assert r["result"] == "completed"
+    assert r["success"] is True
+    assert r["current_step_index"] == 4
+    assert r["total_steps"] == 4
+    assert r["elapsed_s"] >= 0
+
+
+def test_last_job_result_cancelled_on_protective_stop_during_run(
+        cabinet_with_tick) -> None:
+    """If a running job is cancelled by a protective stop, last_job_result
+    must record a 'cancelled' result with success=False (NOT 'completed'
+    / success=True)."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    # Wait for it to actually start moving.
+    time.sleep(0.2)
+    cab.trigger_protective_stop()
+    # Wait for the runner thread to terminate and the cabinet callback
+    # to fire.
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        r = cab.get_status().last_job_result
+        if r is not None:
+            break
+        time.sleep(0.05)
+    r = cab.get_status().last_job_result
+    assert r is not None
+    assert r["job_id"] == "DEMO_SEQUENCE_001"
+    assert r["completed"] is True
+    assert r["success"] is False
+    # The result must be 'cancelled' (NOT 'completed'); it could also be
+    # 'failed' if the cancel_reason happened to start with "fault:".
+    assert r["result"] in ("cancelled", "failed")
+
+
+def test_post_completion_readiness_loss_lands_in_waiting(
+        cabinet_with_tick) -> None:
+    """After a job completes, if a non-safety readiness input becomes
+    False, the cabinet must transition to WAITING (not stay in READY)."""
+    cab = cabinet_with_tick
+    cab.start_job()
+    _wait_for_completion(cab)
+    assert cab.state == CabinetState.READY
+    cab.set_input("part_present", False)
+    # post-completion, re-eval must flip READY -> WAITING.
+    assert cab.state == CabinetState.WAITING
+    s = cab.get_status()
+    assert s.last_job_result is not None
+    assert s.last_job_result["success"] is True

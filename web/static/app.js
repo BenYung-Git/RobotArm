@@ -253,6 +253,10 @@
     setText("cab-updated", s.updated_at ? new Date(s.updated_at * 1000).toLocaleTimeString() : "—");
 
     // Job
+    // Render priority (per 2026-09-16 bug-fix spec):
+    //   1. active_job_id set       -> live progress for that running job
+    //   2. last_job_result present -> terminal result of the most recent job
+    //   3. neither                 -> show "—"
     if (s.active_job_id) {
       setText("job-id", s.active_job_id);
       setText("job-progress",
@@ -262,6 +266,22 @@
           ? `${s.current_step_id} (${s.current_step_name || ""})`
           : (s.current_step_name || "—"));
       setText("job-elapsed", "");
+    } else if (s.last_job_result) {
+      // Terminal result rendering — kept until a new job starts.
+      const r = s.last_job_result;
+      const isZh = (STRINGS && STRINGS.__lang === "zh");
+      const stepLabel = isZh && r.current_step_zh
+        ? r.current_step_zh
+        : (r.current_step || "—");
+      setText("job-id", r.job_id || "—");
+      setText("job-progress",
+        `${r.current_step_index || "?"} / ${r.total_steps || "?"}`);
+      setText("job-step", stepLabel);
+      // Elapsed is rounded to 1 decimal for readability in the UI.
+      const elapsed = (typeof r.elapsed_s === "number")
+        ? `${r.elapsed_s.toFixed(2)} s`
+        : "—";
+      setText("job-elapsed", elapsed);
     } else {
       setText("job-id", "—");
       setText("job-progress", "—");
@@ -557,7 +577,115 @@
   // ---- Boot --------------------------------------------------------------
   loadTranslations().then(loadSpecAndStartPolling);
   drawGrid();
+  wireStatusModal();
 
   // Expose a tiny API for tests / debugging.
-  window.__robotarm = { poll, applyStatus, lastStatus: () => lastStatus };
+  window.__robotarm = { poll, applyStatus, lastStatus: () => lastStatus,
+                        openStatusModal, buildStatusSnapshot };
+
+  // ---- Status copy modal -------------------------------------------------
+  //
+  // 2026-09-16 addition (Ben): provide a plain-text snapshot of the live
+  // status so it can be selected + copied via Ctrl+A / Ctrl+C, without
+  // fighting the 400ms polling-driven DOM updates that wipe text selection
+  // on the live status table.
+  //
+  // Pure frontend. Backend / tests / README / app.py untouched.
+  function buildStatusSnapshot(s) {
+    // Defensive: if no status yet, return a placeholder.
+    if (!s) return "(no status yet — wait for first poll)";
+    const sl = s.status_light || {};
+    const vi = s.virtual_inputs || {};
+    const vo = s.virtual_outputs || {};
+    const lj = s.last_job_result || null;
+    const lines = [];
+    lines.push(`Cabinet State: ${s.cabinet_state || "—"}`);
+    const slDesc = `${sl.color || "—"}${sl.is_blinking ? " (blinking)" : ""} - ${sl.label_en || "—"}${sl.reason_en ? " (" + sl.reason_en + ")" : ""}`;
+    lines.push(`Status Light: ${slDesc}`);
+    if (sl.label_zh || sl.reason_zh) {
+      lines.push(`Status Light (zh): ${sl.label_zh || "—"}${sl.reason_zh ? " (" + sl.reason_zh + ")" : ""}`);
+    }
+    lines.push(`Safety State: ${s.safety_state || "—"}`);
+    lines.push(`Motion State: ${s.motion_state || "—"}`);
+    lines.push(`Fault: ${s.fault ? ((s.fault.code || "") + " — " + (s.fault.message || "")) : "(none)"}`);
+    lines.push("Virtual Inputs:");
+    lines.push(`  - part_present: ${vi.part_present}`);
+    lines.push(`  - fixture_clamped: ${vi.fixture_clamped}`);
+    lines.push(`  - welder_ready: ${vi.welder_ready}`);
+    lines.push(`  - safety_gate_closed: ${vi.safety_gate_closed}`);
+    lines.push(`Cycle Running: ${vo.cycle_running}`);
+    lines.push(`Stack Light Green: ${vo.stack_light_green}`);
+    lines.push(`Stack Light Red: ${vo.stack_light_red}`);
+    lines.push("Active Job:");
+    if (s.active_job_id) {
+      lines.push(`  - job_id: ${s.active_job_id}`);
+      lines.push(`  - progress: ${s.current_step_index || "?"} / ${s.total_steps || "?"}`);
+      lines.push(`  - current_step_id: ${s.current_step_id || "—"}`);
+      lines.push(`  - current_step_name: ${s.current_step_name || "—"}`);
+    } else {
+      lines.push("  (none)");
+    }
+    lines.push("Last Job Result:");
+    if (lj) {
+      lines.push(`  - job_id: ${lj.job_id}`);
+      lines.push(`  - progress: ${lj.current_step_index || "?"} / ${lj.total_steps || "?"}`);
+      lines.push(`  - current_step: ${lj.current_step || "—"}${lj.current_step_zh ? " / " + lj.current_step_zh : ""}`);
+      lines.push(`  - result: ${lj.result || "—"}`);
+      lines.push(`  - success: ${lj.success}`);
+      lines.push(`  - elapsed: ${typeof lj.elapsed_s === "number" ? lj.elapsed_s.toFixed(3) + "s" : "—"}`);
+      lines.push(`  - finished_at: ${typeof lj.finished_at === "number" ? new Date(lj.finished_at * 1000).toISOString() : "—"}`);
+    } else {
+      lines.push("  (none)");
+    }
+    return lines.join("\n");
+  }
+
+  function openStatusModal() {
+    const backdrop = document.getElementById("status-modal-backdrop");
+    const body = document.getElementById("status-modal-body");
+    if (!backdrop || !body) return;
+    body.textContent = buildStatusSnapshot(lastStatus);
+    backdrop.classList.remove("hidden");
+    backdrop.setAttribute("aria-hidden", "false");
+    // Move focus into the body so Ctrl+A selects the snapshot text.
+    body.focus();
+  }
+
+  function closeStatusModal() {
+    const backdrop = document.getElementById("status-modal-backdrop");
+    if (!backdrop) return;
+    backdrop.classList.add("hidden");
+    backdrop.setAttribute("aria-hidden", "true");
+    // Return focus to the trigger button.
+    const trigger = document.getElementById("btn-status-copy");
+    if (trigger) trigger.focus();
+  }
+
+  function wireStatusModal() {
+    const trigger = document.getElementById("btn-status-copy");
+    const backdrop = document.getElementById("status-modal-backdrop");
+    const closeBtn = document.getElementById("status-modal-close");
+    const closeBtn2 = document.getElementById("status-modal-close-btn");
+    if (trigger) {
+      trigger.addEventListener("click", openStatusModal);
+    }
+    if (closeBtn) {
+      closeBtn.addEventListener("click", closeStatusModal);
+    }
+    if (closeBtn2) {
+      closeBtn2.addEventListener("click", closeStatusModal);
+    }
+    if (backdrop) {
+      // Click on the backdrop itself (NOT inside the modal) closes.
+      backdrop.addEventListener("click", (e) => {
+        if (e.target === backdrop) closeStatusModal();
+      });
+    }
+    // Esc closes the modal.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && backdrop && !backdrop.classList.contains("hidden")) {
+        closeStatusModal();
+      }
+    });
+  }
 })();
